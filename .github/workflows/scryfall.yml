@@ -1,0 +1,41 @@
+name: Scryfall mirror
+
+on:
+  schedule:
+    - cron: "37 4 * * *"   # dagligt kl. 05:37 / 06:37 dansk tid
+  workflow_dispatch:        # "Run workflow"-knap under Actions
+
+permissions:
+  contents: write   # push til data-branchen
+  actions: write    # holde det planlagte job aktivt
+
+concurrency:
+  group: scryfall-mirror
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Byg data fra Scryfall
+        run: python3 "$(find . -name build.py -not -path './.git/*' | head -1)" "$RUNNER_TEMP/out"
+
+      - name: Publicér til data-branchen
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$RUNNER_TEMP/out"
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Scryfall data $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" data
+
+      - name: Hold det planlagte job aktivt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/scryfall.yml/enable" || true
