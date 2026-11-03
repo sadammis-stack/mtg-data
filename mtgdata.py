@@ -3,14 +3,15 @@
 mtgdata.py — Scryfall-kortdata via GitHub-spejlet (ingen direkte Scryfall-kald).
 
   python3 mtgdata.py info                         dato for data + antal
-  python3 mtgdata.py card NAVN [NAVN ...] [--json] oracle-tekst, legalitet, priser
+  python3 mtgdata.py card NAVN [NAVN ...] [-s|--json]  oracle-tekst, legalitet, priser (-s: én linje pr. kort)
   python3 mtgdata.py prints NAVN                  alle papirprints med Cardmarket trend
   python3 mtgdata.py set SET NR                   ét print ud fra set-kode + collector number
   python3 mtgdata.py cm ID [ID ...]               print ud fra Cardmarket idProduct
   python3 mtgdata.py rulings NAVN                 officielle rulings
   python3 mtgdata.py search REGEX [--ci UR] [--type Instant] [--max-cmc 2] [--commander]
-  python3 mtgdata.py deck FIL [-o ud.csv] [--skip-basics]
-                                                  dekliste → oracle + pris pr. kort + total
+  python3 mtgdata.py deck FIL [-o ud.csv] [--skip-basics] [--text]
+                                                  dekliste → pris pr. kort + total + Game Changers
+                                                  (--text: oracle-tekst for hele listen, én linje pr. kort)
 
 Kan også importeres:  from mtgdata import find, prints_for, by_set, by_cardmarket, search
 
@@ -26,13 +27,14 @@ import gzip
 import json
 import os
 import re
+import signal
 import sys
 import time
 import unicodedata
 import urllib.request
 from pathlib import Path
 
-REPO = os.environ.get("MTGDATA_REPO", "CHANGE-ME/mtg-data")
+REPO = os.environ.get("MTGDATA_REPO", "sadammis-stack/mtg-data")
 BASE = os.environ.get("MTGDATA_URL") or f"https://raw.githubusercontent.com/{REPO}/data"
 CACHE = Path(os.environ.get("MTGDATA_CACHE", Path.home() / ".cache" / "mtgdata"))
 RECHECK_SECONDS = 6 * 3600
@@ -114,14 +116,22 @@ def meta():
 
 # ---------------------------------------------------------------- navne
 
-def norm(s):
+def norm(s, front_only=True):
+    """Normaliseret navn. front_only=True: kun forsiden af "A // B"; False: hele navnet."""
     s = unicodedata.normalize("NFKD", s or "")
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.replace("’", "'").replace("‘", "'").lower()
     s = s.replace("æ", "ae")
-    s = re.split(r"\s*//\s*", s)[0]
+    if front_only:
+        s = re.split(r"\s*//\s*", s)[0]
     s = re.sub(r"[^a-z0-9 ]+", "", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def ci_str(c):
+    """Color identity i WUBRG-rækkefølge, fx "UR"."""
+    have = set(c.get("color_identity") or [])
+    return "".join(x for x in "WUBRG" if x in have)
 
 
 # ---------------------------------------------------------------- oracle
@@ -135,34 +145,70 @@ def oracle():
     if _oracle is None:
         with gzip.open(ensure("oracle.jsonl.gz"), "rt", encoding="utf-8") as f:
             cards = [json.loads(line) for line in f]
-        idx = {}
-        for c in cards:
-            keys = {norm(c["name"])} | {norm(x.get("name", "")) for x in c.get("faces", [])}
-            for k in keys:
-                cur = idx.get(k)
-                # spillekort går forud for tokens/emblems med samme navn
-                if cur is None or (cur.get("layout") in NON_GAME and c.get("layout") not in NON_GAME):
-                    idx[k] = c
-        _oracle = (cards, idx)
+        full, idx = {}, {}
+        # 1. pas: hele navne og forsider; 2. pas: øvrige halvdele ("Fire" → Fire // Ice, ikke Start // Fire)
+        for front in (True, False):
+            for c in cards:
+                if front:
+                    full.setdefault(norm(c["name"], front_only=False), c)
+                    keys = {norm(c["name"])}
+                else:
+                    keys = {norm(x.get("name", "")) for x in c.get("faces", [])[1:]}
+                for k in keys:
+                    cur = idx.get(k)
+                    # spillekort går forud for tokens/emblems med samme navn
+                    if cur is None or (front and cur.get("layout") in NON_GAME
+                                       and c.get("layout") not in NON_GAME):
+                        idx[k] = c
+        _oracle = (cards, idx, full)
     return _oracle
 
 
 def find(name):
     """Returnerer (kort, 'exact'|'fuzzy') eller (None, None)."""
-    _, idx = oracle()
-    k = norm(name)
-    if k in idx:
-        return idx[k], "exact"
-    if len(k) >= 4:  # entydigt præfiks, fx "delver" → Delver of Secrets
-        hits = {id(c): c for key, c in idx.items() if key.startswith(k) and c.get("layout") not in NON_GAME}
+    _, idx, full = oracle()
+    kf, k = norm(name, front_only=False), norm(name)
+    c = full.get(kf) or idx.get(k)       # hele navnet ("Fire // Ice") eller forside/halvdel
+    if c:
+        if c.get("layout") in NON_GAME:  # "Ragavan" (Vanguard) → Ragavan, Nimble Pilferer
+            hits = _prefix_hits(k)
+            if len(hits) == 1:
+                return hits[0], "fuzzy"
+        return c, "exact"
+    if len(k) >= 4:  # præfiks: entydigt → brug det; flertydigt → gæt ikke
+        hits = _prefix_hits(k)
         if len(hits) == 1:
-            return next(iter(hits.values())), "fuzzy"
+            return hits[0], "fuzzy"
+        if len(hits) > 1:
+            return None, "ambiguous"
     m = difflib.get_close_matches(k, idx.keys(), n=1, cutoff=0.82)
     return (idx[m[0]], "fuzzy") if m else (None, None)
 
 
+def _prefix_hits(k):
+    idx = oracle()[1]
+    hits = {c["name"]: c for key, c in idx.items() if key.startswith(k) and c.get("layout") not in NON_GAME}
+    return [hits[n] for n in sorted(hits)]
+
+
+def suggest(name, n=8):
+    """Navneforslag når find() ikke finder et entydigt kort."""
+    k = norm(name)
+    hits = [c["name"] for c in _prefix_hits(k)] if len(k) >= 3 else []
+    if not hits:
+        idx = oracle()[1]
+        hits = list(dict.fromkeys(idx[m]["name"] for m in difflib.get_close_matches(k, idx.keys(), n=n, cutoff=0.6)))
+    return hits[:n]
+
+
+def _not_found(name, how):
+    s = suggest(name)
+    label = "FLERTYDIG" if how == "ambiguous" else "IKKE FUNDET"
+    return f"{label}: {name}" + (f"  → mente du: {'; '.join(s)}" if s else "")
+
+
 def search(pattern, ci=None, type_=None, max_cmc=None, commander=False, include_tokens=False):
-    cards, _ = oracle()
+    cards = oracle()[0]
     rx = re.compile(pattern, re.I)
     allowed = set(ci.upper()) if ci else None
     trx = re.compile(type_, re.I) if type_ else None
@@ -278,12 +324,13 @@ def price_deck(entries, skip_basics=False):
     rows = []
     for e in entries:
         card, how = find(e["name"])
-        row = {"qty": e["qty"], "input": e["name"], "match": how or "IKKE FUNDET"}
+        row = {"qty": e["qty"], "input": e["name"],
+               "match": how if card else ("FLERTYDIG" if how == "ambiguous" else "IKKE FUNDET")}
         if card:
             row.update({
                 "name": card["name"], "mana_cost": card.get("mana_cost", ""), "cmc": card.get("cmc"),
                 "type_line": card.get("type_line", ""),
-                "color_identity": "".join(card.get("color_identity") or []),
+                "color_identity": ci_str(card),
                 "commander": card.get("commander", ""),
                 "game_changer": "ja" if card.get("game_changer") else "",
                 "eur_min": card.get("eur_min"), "eur_min_print": card.get("eur_min_print", ""),
@@ -323,7 +370,7 @@ def show_card(c, how=None):
                 print(f"    {ln}")
     else:
         print(c.get("oracle_text", ""))
-    ci = "".join(c.get("color_identity") or []) or "farveløs"
+    ci = ci_str(c) or "farveløs"
     print(f"CI: {ci} · Commander: {c.get('commander', '?')} · "
           f"Game Changer: {'ja' if c.get('game_changer') else 'nej'}"
           f"{' · Reserved List' if c.get('reserved') else ''}"
@@ -332,6 +379,24 @@ def show_card(c, how=None):
           f"foil {_eur(c.get('eur_foil_min'))} ({c.get('eur_foil_min_print', '–')}) · "
           f"standardprint {_eur(c.get('eur_default'))} · {c.get('prints', 0)} prints")
     print(c.get("uri", ""))
+
+
+def short_line(c):
+    """Ét kort på én linje med fuld oracle-tekst — billigst i tokens ved mange kort."""
+    def face(f):
+        pt = f" {f['power']}/{f['toughness']}" if "power" in f else ""
+        loy = f" L{f['loyalty']}" if "loyalty" in f else ""
+        cost = f" {f['mana_cost']}" if f.get("mana_cost") else ""
+        txt = (f.get("oracle_text") or "").replace("\n", " ¶ ")
+        return f"{f.get('name')}{cost} | {f.get('type_line', '')}{pt}{loy} | {txt}"
+    body = " // ".join(face(f) for f in c["faces"]) if c.get("faces") else face(c)
+    tags = [f"CI {ci_str(c) or 'C'}"]
+    if c.get("commander") != "legal":
+        tags.append(f"CMD {c.get('commander')}")
+    if c.get("game_changer"):
+        tags.append("GC")
+    tags.append(_eur(c.get("eur_min")))
+    return f"{body} [{' · '.join(tags)}]"
 
 
 def show_print(p):
@@ -343,10 +408,13 @@ def show_print(p):
 
 
 def main(argv=None):
+    if hasattr(signal, "SIGPIPE"):  # stille exit ved "| head" (ingen traceback)
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     ap = argparse.ArgumentParser(description="Scryfall-kortdata via GitHub-spejl")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("info")
     s = sub.add_parser("card"); s.add_argument("names", nargs="+"); s.add_argument("--json", action="store_true")
+    s.add_argument("-s", "--short", action="store_true", help="én linje pr. kort")
     s = sub.add_parser("prints"); s.add_argument("name")
     s = sub.add_parser("set"); s.add_argument("set"); s.add_argument("number")
     s = sub.add_parser("cm"); s.add_argument("ids", nargs="+")
@@ -356,6 +424,7 @@ def main(argv=None):
     s.add_argument("--commander", action="store_true"); s.add_argument("--limit", type=int, default=100)
     s = sub.add_parser("deck"); s.add_argument("file"); s.add_argument("-o", "--out")
     s.add_argument("--skip-basics", action="store_true")
+    s.add_argument("--text", action="store_true", help="oracle-tekst pr. kort (én linje) i stedet for pristabel")
     a = ap.parse_args(argv)
 
     if a.cmd == "info":
@@ -366,19 +435,21 @@ def main(argv=None):
         for i, n in enumerate(a.names):
             c, how = find(n)
             if not c:
-                print(f"IKKE FUNDET: {n}", file=sys.stderr)
+                print(_not_found(n, how), file=sys.stderr)
                 continue
             found.append(c)
-            if not a.json:
+            if a.short:
+                print(short_line(c) + (f" (fuzzy: «{n}»)" if how == "fuzzy" else ""))
+            elif not a.json:
                 if i:
-                    print("-" * 60)
+                    print("—")
                 show_card(c, how)
         if a.json:
             print(json.dumps(found, ensure_ascii=False, indent=1))
     elif a.cmd == "prints":
-        c, _ = find(a.name)
+        c, how = find(a.name)
         if not c:
-            sys.exit(f"IKKE FUNDET: {a.name}")
+            sys.exit(_not_found(a.name, how))
         print(f"{c['name']} — {c.get('prints', 0)} papirprints (sorteret efter EUR trend)")
         for p in prints_for(c):
             print(f"  {p['set'].upper():>6} {p['collector_number']:<8} {p['rarity'][:1].upper()} "
@@ -411,19 +482,24 @@ def main(argv=None):
         rows = price_deck(entries, a.skip_basics)
         total = sum(r.get("line_eur_min") or 0 for r in rows)
         cards = sum(r["qty"] for r in rows)
-        missing = [r["input"] for r in rows if r["match"] == "IKKE FUNDET"]
+        missing = [r["input"] for r in rows if r["match"] in ("IKKE FUNDET", "FLERTYDIG")]
         fuzzy = [f"{r['input']} → {r['name']}" for r in rows if r["match"] == "fuzzy"]
         gcs = sorted({r["name"] for r in rows if r.get("game_changer")})
-        for r in sorted(rows, key=lambda r: -(r.get("line_eur_min") or 0)):
-            print(f"{r['qty']:>3} {r.get('name', r['input']):<40} {_eur(r.get('eur_min')):>9}  "
-                  f"{r.get('eur_min_print', '')}")
+        if a.text:
+            for e, r in zip(entries, rows):
+                if r["match"] in ("exact", "fuzzy"):
+                    print(f"{e['qty']} {short_line(find(e['name'])[0])}")
+        else:
+            for r in sorted(rows, key=lambda r: -(r.get("line_eur_min") or 0)):
+                print(f"{r['qty']:>3} {r.get('name', r['input']):<40} {_eur(r.get('eur_min')):>9}  "
+                      f"{r.get('eur_min_print', '')}")
         print(f"\n{cards} kort · billigste-print-total {_eur(total)}"
               f"{' (basics ikke medregnet)' if a.skip_basics else ''}")
         print(f"Game Changers ({len(gcs)}): {', '.join(gcs) or '–'}")
         if fuzzy:
             print("Fuzzy matches: " + "; ".join(fuzzy))
-        if missing:
-            print("IKKE FUNDET: " + "; ".join(missing))
+        for name in missing:
+            print(_not_found(name, find(name)[1]))
         if a.out:
             cols = ["qty", "input", "match", "name", "mana_cost", "cmc", "type_line", "color_identity",
                     "commander", "game_changer", "eur_min", "eur_min_print", "eur_default",

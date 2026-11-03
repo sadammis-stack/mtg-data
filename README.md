@@ -21,16 +21,20 @@ URL-mønster: `https://raw.githubusercontent.com/<ejer>/mtg-data/data/<fil>`
 ## Opslag med mtgdata.py
 
 ```
-python3 mtgdata.py card "Sol Ring" "Mana Crypt"
+python3 mtgdata.py card "Sol Ring" "Mana Crypt"          # fuld visning
+python3 mtgdata.py card -s "Sol Ring" "Mana Crypt"       # én linje pr. kort (kompakt)
 python3 mtgdata.py prints "Urza's Saga"
 python3 mtgdata.py set SLD 1512
-python3 mtgdata.py cm 560000
+python3 mtgdata.py cm 763687
 python3 mtgdata.py rulings "Thassa's Oracle"
 python3 mtgdata.py search "draw a card" --ci UR --type instant --max-cmc 2 --commander
+python3 mtgdata.py deck vivi.txt                          # pris pr. kort + total + Game Changers
+python3 mtgdata.py deck vivi.txt --text                   # oracle-tekst for hele listen, én linje pr. kort
 python3 mtgdata.py deck vivi.txt -o vivi_priser.csv --skip-basics
 ```
 
-Sæt `REPO` øverst i `mtgdata.py` (eller miljøvariablen `MTGDATA_REPO`) til `<ejer>/mtg-data`.
+Henter fra `sadammis-stack/mtg-data` som standard (kan overstyres med `MTGDATA_REPO`).
+Kræver kun Python 3 — virker også lokalt på Windows: `py mtgdata.py card -s "Sol Ring"`.
 
 ## Drift
 
