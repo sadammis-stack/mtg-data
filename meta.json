@@ -1,0 +1,19 @@
+{
+  "built_at": "2026-11-14T05:26:00Z",
+  "scryfall_updated_at": {
+    "oracle_cards": "2026-11-13T22:01:58.567+00:00",
+    "default_cards": "2026-11-13T22:06:41.635+00:00",
+    "rulings": "2026-11-13T22:00:32.619+00:00"
+  },
+  "counts": {
+    "oracle": 35992,
+    "prints": 110897,
+    "rulings": 20075
+  },
+  "files": {
+    "oracle.jsonl.gz": 5234603,
+    "prints.csv.gz": 9431556,
+    "rulings.jsonl.gz": 5419736
+  },
+  "source": "Scryfall bulk data \u2014 https://scryfall.com/docs/api/bulk-data"
+}
